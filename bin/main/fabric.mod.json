@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "chunkminer",
+  "version": "${version}",
+  "name": "Chunk Miner",
+  "description": "Mine a 16x16 chunk progressively using vanilla mining speed, tool modifiers, and a durability reserve.",
+  "authors": ["Aarav"],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.aarav.chunkminer.ChunkMinerMod"],
+    "client": ["com.aarav.chunkminer.client.ChunkMinerClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
