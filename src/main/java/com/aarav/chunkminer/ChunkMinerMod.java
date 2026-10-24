@@ -22,7 +22,8 @@ public final class ChunkMinerMod implements ModInitializer {
 
     private static final int DURABILITY_RESERVE = 10;
 
-    // Each position is visited at most once. These limits bound scanning work per server tick.
+    // Fast mining breaks a fixed number of blocks per server tick, while scan limits bound CPU work.
+    private static final int BLOCKS_PER_JOB_PER_TICK = 8;
     private static final int MAX_SCANS_PER_JOB_PER_TICK = 1_024;
     private static final int MAX_SCANS_GLOBAL_PER_TICK = 4_096;
     private static final int MAX_ACTIVE_JOBS = 4;
@@ -88,7 +89,7 @@ public final class ChunkMinerMod implements ModInitializer {
 
         player.sendSystemMessage(net.minecraft.network.chat.Component.literal(
                 "Chunk Miner: started chunk [" + chunkX + ", " + chunkZ
-                        + "]. Mining uses vanilla speed. Press G again to cancel."
+                        + "]. Fast mining enabled (up to 8 blocks per tick). Press G again to cancel."
         ));
     }
 
@@ -125,37 +126,18 @@ public final class ChunkMinerMod implements ModInitializer {
                 continue;
             }
 
-            // If a target is already being mined, advance its vanilla mining progress first.
-            if (job.targetPos != null) {
-                boolean targetFinished = advanceTarget(player, job, heldTool);
-                if (!targetFinished) {
-                    continue;
-                }
-
-                // Never destroy more than one block for this job in a single tick.
-                if (job.isComplete()) {
-                    player.sendSystemMessage(net.minecraft.network.chat.Component.literal(
-                            "Chunk Miner: chunk finished."
-                    ));
-                    iterator.remove();
-                }
-                continue;
+            if (globalScanBudget > 0) {
+                int scanBudget = Math.min(MAX_SCANS_PER_JOB_PER_TICK, globalScanBudget);
+                int scanned = processFastMiningTick(player, job, heldTool, scanBudget);
+                globalScanBudget -= scanned;
             }
 
-            if (globalScanBudget <= 0) {
+            if (remainingDurability(heldTool) <= DURABILITY_RESERVE) {
+                player.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+                        "Chunk Miner: stopped to preserve the last 10 durability."
+                ));
+                iterator.remove();
                 continue;
-            }
-
-            int budget = Math.min(MAX_SCANS_PER_JOB_PER_TICK, globalScanBudget);
-            int scanned = scanForTarget(job, budget);
-            globalScanBudget -= scanned;
-
-            // Start accruing progress on the first target in the same tick it is found.
-            if (job.targetPos != null) {
-                boolean targetFinished = advanceTarget(player, job, heldTool);
-                if (!targetFinished) {
-                    continue;
-                }
             }
 
             if (job.isComplete()) {
@@ -167,11 +149,22 @@ public final class ChunkMinerMod implements ModInitializer {
         }
     }
 
-    /** Scans a bounded number of positions without allocating a queue for the whole chunk. */
-    private static int scanForTarget(MiningJob job, int budget) {
+    /**
+     * Fast mode: immediately destroys up to eight eligible blocks per server tick.
+     * Position scanning is incremental and bounded, so the mod does not allocate a queue
+     * containing every block position in the chunk when G is pressed.
+     *
+     * @return number of positions scanned, used to enforce the global per-tick scan budget
+     */
+    private static int processFastMiningTick(ServerPlayer player, MiningJob job,
+                                             ItemStack tool, int scanBudget) {
         int scanned = 0;
+        int destroyed = 0;
 
-        while (scanned < budget && job.nextIndex < job.totalPositions) {
+        while (scanned < scanBudget
+                && destroyed < BLOCKS_PER_JOB_PER_TICK
+                && job.nextIndex < job.totalPositions
+                && remainingDurability(tool) > DURABILITY_RESERVE) {
             BlockPos pos = job.positionAt(job.nextIndex++);
             scanned++;
 
@@ -180,53 +173,15 @@ public final class ChunkMinerMod implements ModInitializer {
                 continue;
             }
 
-            job.targetPos = pos;
-            job.targetState = state;
-            job.progress = 0.0F;
-            break;
+            // Use the server's normal block-destruction pathway for drops, harvest checks,
+            // enchantments, durability, and block-break hooks. This deliberately skips
+            // vanilla mining-time accumulation to preserve the original fast behavior.
+            if (player.gameMode.destroyBlock(pos)) {
+                destroyed++;
+            }
         }
 
         return scanned;
-    }
-
-    /**
-     * Adds one tick of Minecraft's own block-damage progress. The state method accounts for
-     * hardness, the held tool, Efficiency, haste, water, and other vanilla mining modifiers.
-     * Returns true when this target was cleared or broken; false while it remains in progress.
-     */
-    private static boolean advanceTarget(ServerPlayer player, MiningJob job, ItemStack tool) {
-        BlockPos pos = job.targetPos;
-        if (pos == null) {
-            return true;
-        }
-
-        BlockState state = job.level.getBlockState(pos);
-        if (!isEligibleTarget(job, state, pos) || state != job.targetState) {
-            job.clearTarget();
-            return true;
-        }
-
-        if (remainingDurability(tool) <= DURABILITY_RESERVE) {
-            return true;
-        }
-
-        float delta = state.getDestroyProgress(player, job.level, pos);
-        if (!(delta > 0.0F) || !Float.isFinite(delta)) {
-            // Avoid getting stuck forever if a block cannot accrue mining progress.
-            job.clearTarget();
-            return true;
-        }
-
-        job.progress += delta;
-        if (job.progress < 1.0F) {
-            return false;
-        }
-
-        // Use the server's normal destruction path for harvest checks, drops, enchantments,
-        // tool damage, and block-break hooks. Progress above controls when this is called.
-        player.gameMode.destroyBlock(pos);
-        job.clearTarget();
-        return true;
     }
 
     private static boolean isEligibleTarget(MiningJob job, BlockState state, BlockPos pos) {
@@ -256,9 +211,6 @@ public final class ChunkMinerMod implements ModInitializer {
         private final ItemStack tool;
 
         private long nextIndex;
-        private BlockPos targetPos;
-        private BlockState targetState;
-        private float progress;
 
         private MiningJob(ServerLevel level, int chunkX, int chunkZ,
                           int minY, int maxY, int startY, ItemStack tool) {
@@ -290,14 +242,8 @@ public final class ChunkMinerMod implements ModInitializer {
             return new BlockPos(chunkX * 16 + xOffset, y, chunkZ * 16 + zOffset);
         }
 
-        private void clearTarget() {
-            targetPos = null;
-            targetState = null;
-            progress = 0.0F;
-        }
-
         private boolean isComplete() {
-            return nextIndex >= totalPositions && targetPos == null;
+            return nextIndex >= totalPositions;
         }
     }
 }
